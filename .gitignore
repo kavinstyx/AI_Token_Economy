@@ -1,0 +1,19 @@
+# Secrets — NEVER commit
+Gemini API key.txt
+*.env
+.env
+
+# Local data / logs
+usage.db
+*.log
+*.bak
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Editor / OS
+.vscode/
+.DS_Store

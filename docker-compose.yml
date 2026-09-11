@@ -1,0 +1,33 @@
+services:
+  litellm:
+    image: docker.litellm.ai/berriai/litellm:main-latest
+    ports:
+      - "4000:4000"
+    volumes:
+      - ./litellm_config.yaml:/app/config.yaml
+    environment:
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
+    command: ["--config", "/app/config.yaml"]
+    depends_on:
+      - ollama
+      - postgres
+
+  ollama:
+    image: ollama/ollama:latest
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama-data:/root/.ollama
+
+  postgres:
+    image: postgres:15-alpine
+    environment:
+      - POSTGRES_USER=litellm
+      - POSTGRES_PASSWORD=litellm
+      - POSTGRES_DB=litellm
+    volumes:
+      - pg-data:/var/lib/postgresql/data
+
+volumes:
+  ollama-data:
+  pg-data:
