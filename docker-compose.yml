@@ -7,6 +7,9 @@ services:
       - ./litellm_config.yaml:/app/config.yaml
     environment:
       - GEMINI_API_KEY=${GEMINI_API_KEY}
+      - GROQ_API_KEY=${GROQ_API_KEY}
+      - OPENROUTER_API_KEY=${OPENROUTER_API_KEY}
+      - MISTRAL_API_KEY=${MISTRAL_API_KEY}
     command: ["--config", "/app/config.yaml"]
     depends_on:
       - ollama
@@ -28,6 +31,20 @@ services:
     volumes:
       - pg-data:/var/lib/postgresql/data
 
+  mysql:
+    image: mysql:8.0
+    ports:
+      - "3308:3306"
+    environment:
+      - MYSQL_ROOT_PASSWORD=rootpass
+      - MYSQL_DATABASE=token_economy
+      - MYSQL_USER=appuser
+      - MYSQL_PASSWORD=apppass
+    volumes:
+      - mysql-data:/var/lib/mysql
+      - ./schema.sql:/docker-entrypoint-initdb.d/schema.sql
+
 volumes:
   ollama-data:
   pg-data:
+  mysql-data:

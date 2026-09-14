@@ -1,90 +1,90 @@
 """
-decider.py — the routing "brain".
-
-Phase 1: simple, transparent, rule-based. Given a prompt, decide which model
-to use and RETURN THE REASON too (so the UI can show why).
-
-Later: replace `decide()`'s body with a DB lookup of model/provider specs.
-The function signature stays the same, so nothing downstream changes.
+decider.py — routing brain.
+Primary: read model_specs + routing_rules from MySQL.
+Fallback: if DB is unreachable, log the error and use hardcoded rules.
 """
-
+import os
+import logging
 from dataclasses import dataclass
+import mysql.connector
 
-# The model names here must match the `model_name` values in your litellm_config.yaml
+# --- error logging to FILE (works even when DB is down) ---
+logging.basicConfig(
+    filename=os.environ.get("ERROR_LOG", "errors.log"),
+    level=logging.WARNING,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+)
+log = logging.getLogger("decider")
+
+# model names must match litellm_config.yaml
 LOCAL_MODEL = "local-qwen"
 EXTERNAL_MODEL = "gemini-flash"
 
-# --- crude cost hint (illustrative only; NOT the conversion layer) ---
-# Lower = cheaper to us. Local is ~free once the GPU/CPU is running.
-# This is just so the reason string can mention "cheaper".
-COST_HINT = {
-    LOCAL_MODEL: "very low (our own machine)",
-    EXTERNAL_MODEL: "per-token (external API)",
-}
+DB = dict(
+    host=os.environ.get("DB_HOST", "localhost"),
+    port=int(os.environ.get("DB_PORT", "3308")),
+    database=os.environ.get("DB_NAME", "token_economy"),
+    user=os.environ.get("DB_USER", "appuser"),
+    password=os.environ.get("DB_PASSWORD", "apppass"),
+)
 
-# Keywords that suggest a harder / specialist task better sent to the stronger model.
-_HARD_KEYWORDS = [
-    "code", "python", "javascript", "sql", "regex", "algorithm",
-    "legal", "contract", "medical", "translate", "prove", "analyze",
-    "essay", "summarize this", "write a report",
-]
-
-# Length threshold (characters). Short prompts -> local is usually fine.
+# hardcoded fallback rules (same logic as before)
+_HARD_KEYWORDS = ["code","python","javascript","sql","regex","algorithm",
+                  "legal","contract","medical","translate","prove","analyze","essay"]
 _LENGTH_THRESHOLD = 240
 
 
 @dataclass
 class Decision:
-    model: str          # the model_name to send to LiteLLM
-    reason: str         # human-readable why, shown in the UI
-    rule: str           # short rule id, handy for logging/debugging
+    model: str
+    reason: str
+    rule: str
+    source: str   # 'db' | 'fallback'
+
+
+def _decide_from_db(prompt: str) -> Decision:
+    """Load rules from MySQL and apply them (first match by priority)."""
+    conn = mysql.connector.connect(**DB, connection_timeout=3)
+    try:
+        cur = conn.cursor(dictionary=True)
+        cur.execute("SELECT * FROM routing_rules WHERE active=TRUE ORDER BY priority ASC")
+        rules = cur.fetchall()
+        text = (prompt or "").strip()
+        lowered = text.lower()
+        for r in rules:
+            ct = r["condition_type"]
+            if ct == "keyword":
+                kws = [k.strip() for k in (r["condition_value"] or "").split(",") if k.strip()]
+                hit = next((k for k in kws if k in lowered), None)
+                if hit:
+                    return Decision(r["target_model"], f"{r['reason_label']} (keyword: '{hit}').", f"db_kw_{hit}", "db")
+            elif ct == "max_chars":
+                if len(text) > int(r["condition_value"]):
+                    return Decision(r["target_model"], f"{r['reason_label']} ({len(text)} chars).", "db_long", "db")
+            elif ct == "default":
+                return Decision(r["target_model"], f"{r['reason_label']} ({len(text)} chars).", "db_default", "db")
+        # if no rule matched at all, use local as last resort
+        return Decision(LOCAL_MODEL, "No rule matched — defaulting to local.", "db_nomatch", "db")
+    finally:
+        conn.close()
+
+
+def _decide_fallback(prompt: str) -> Decision:
+    """Hardcoded rules used when the DB is unreachable."""
+    text = (prompt or "").strip()
+    lowered = text.lower()
+    hit = next((k for k in _HARD_KEYWORDS if k in lowered), None)
+    if hit:
+        return Decision(EXTERNAL_MODEL, f"[FALLBACK] Harder task (keyword: '{hit}').", "fb_kw", "fallback")
+    if len(text) > _LENGTH_THRESHOLD:
+        return Decision(EXTERNAL_MODEL, f"[FALLBACK] Long prompt ({len(text)} chars).", "fb_long", "fallback")
+    return Decision(LOCAL_MODEL, f"[FALLBACK] Short prompt ({len(text)} chars) — local.", "fb_default", "fallback")
 
 
 def decide(prompt: str) -> Decision:
-    """Apply simple rules to choose a model. Order matters: first match wins."""
-    text = (prompt or "").strip()
-    lowered = text.lower()
-
-    # Rule 1 — empty / trivial: send local, no reason to pay.
-    if len(text) == 0:
-        return Decision(LOCAL_MODEL, "Empty prompt — defaulting to local model.", "empty")
-
-    # Rule 2 — looks like a harder/specialist task: use the stronger external model.
-    hit = next((k for k in _HARD_KEYWORDS if k in lowered), None)
-    if hit:
-        return Decision(
-            EXTERNAL_MODEL,
-            f"Detected a harder/specialist task (keyword: '{hit}') — routing to the "
-            f"stronger external model. Cost: {COST_HINT[EXTERNAL_MODEL]}.",
-            "hard_keyword",
-        )
-
-    # Rule 3 — long prompt: likely needs more capability.
-    if len(text) > _LENGTH_THRESHOLD:
-        return Decision(
-            EXTERNAL_MODEL,
-            f"Long prompt ({len(text)} chars > {_LENGTH_THRESHOLD}) — routing to the "
-            f"stronger external model. Cost: {COST_HINT[EXTERNAL_MODEL]}.",
-            "long_prompt",
-        )
-
-    # Rule 4 — default: short & simple → local model (the profit path).
-    return Decision(
-        LOCAL_MODEL,
-        f"Short, simple prompt ({len(text)} chars) — the local model can handle it. "
-        f"Cost: {COST_HINT[LOCAL_MODEL]}. This is the low-cost path.",
-        "default_local",
-    )
-
-
-# quick self-test
-if __name__ == "__main__":
-    tests = [
-        "Hi there",
-        "Write a python function to reverse a linked list",
-        "x" * 300,
-        "What's the capital of France?",
-    ]
-    for t in tests:
-        d = decide(t)
-        print(f"[{d.rule:14}] -> {d.model:12} | {d.reason}")
+    """Try DB rules; on any DB error, log it and fall back to hardcoded rules."""
+    try:
+        return _decide_from_db(prompt)
+    except Exception as e:
+        log.warning(f"DB routing unavailable, using fallback rules. Error: {type(e).__name__}: {e}")
+        return _decide_fallback(prompt)
